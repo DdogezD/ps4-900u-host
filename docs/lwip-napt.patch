@@ -1,0 +1,200 @@
+PS4 9.00 host - ESP32 core lwIP patch (NTP NAPT DNAT + SNTP failover)
+
+Enables lwIP NAPT plus a narrow DNAT receive hook used by ps4-900u-host to
+redirect GoldHEN's hard-coded NTP server (216.239.35.0:123) to the ESP32, and
+shortens the SNTP failover timeout. Nothing else in the network path is touched.
+
+Base (the patch is generated against this exact state):
+  ESP-IDF         : v4.4  (commit 8153bfe "versions: Update version to 4.4.0")
+  lwip submodule  : 2749568f "add function for deinit lwip timers"
+
+Build flags (sdkconfig / sdkconfig.defaults):
+  CONFIG_LWIP_IPV4_NAPT=y
+  CONFIG_LWIP_IP_FORWARD=n
+  CONFIG_LWIP_L2_TO_L3_COPY=y
+
+This file contains TWO hunks; apply each in the directory listed in its marker:
+
+  [1/2] in the esp-idf repo root        -> Kconfig, lwipopts.h
+  [2/2] in components/lwip/lwip         -> lwip source (ip4.c, ip4_napt.c, sntp.c, headers)
+
+
+# ============================================================================
+
+# [1/2] Apply in the ESP-IDF repo root (git apply, or: patch -p1)
+
+# ============================================================================
+
+diff --git a/components/lwip/Kconfig b/components/lwip/Kconfig
+index e229f22..644a963 100644
+--- a/components/lwip/Kconfig
++++ b/components/lwip/Kconfig
+@@ -178,8 +178,6 @@ menu "LWIP"
+ 
+     config LWIP_IPV4_NAPT
+         bool "Enable NAT (new/experimental)"
+-        depends on LWIP_IP_FORWARD
+-        select LWIP_L2_TO_L3_COPY
+         default n
+         help
+             Enabling this option allows Network Address and Port Translation.
+diff --git a/components/lwip/port/esp32/include/lwipopts.h b/components/lwip/port/esp32/include/lwipopts.h
+index 47215e9..532d9bf 100644
+--- a/components/lwip/port/esp32/include/lwipopts.h
++++ b/components/lwip/port/esp32/include/lwipopts.h
+@@ -1062,6 +1062,10 @@
+ #define SNTP_MAX_SERVERS                CONFIG_LWIP_SNTP_MAX_SERVERS
+ #endif // CONFIG_LWIP_SNTP_MAX_SERVERS
+ 
++// Speed up SNTP server failover: wait only 5s for a reply before trying the
++// next server (stock 15s makes a blocked primary stall the clock sync ~30s).
++#define SNTP_RECV_TIMEOUT               5000
++
+ #ifdef CONFIG_LWIP_DHCP_GET_NTP_SRV
+ #define LWIP_DHCP_GET_NTP_SRV           CONFIG_LWIP_DHCP_GET_NTP_SRV
+ #endif // CONFIG_LWIP_DHCP_GET_NTP_SRV
+
+
+# ============================================================================
+
+# [2/2] Apply inside components/lwip/lwip (the lwip submodule)
+
+# ============================================================================
+
+src/apps/sntp/sntp.c         | 11 +++++++++++
+ src/core/ipv4/ip4.c          | 17 +++++++++++++++--
+ src/core/ipv4/ip4_napt.c     | 25 ++++++++++++++++++++++++-
+ src/include/lwip/ip4_napt.h  | 14 ++++++++++++--
+ src/include/lwip/lwip_napt.h |  2 --
+ 5 files changed, 62 insertions(+), 7 deletions(-)
+
+--- Changes ---
+
+src/apps/sntp/sntp.c
+  @@ -586,6 +586,11 @@ sntp_dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg)
+  +#if SNTP_SUPPORT_MULTIPLE_SERVERS
+  +    /* Cancel the DNS-wait timer armed in sntp_request (ERR_INPROGRESS branch),
+  +       otherwise it fires later and prematurely switches to the next server. */
+  +    sys_untimeout(sntp_try_next_server, NULL);
+  +#endif /* SNTP_SUPPORT_MULTIPLE_SERVERS */
+       sntp_send_request(ipaddr);
+     } else {
+       /* DNS resolving failed -> try another server */
+  @@ -618,6 +623,12 @@ sntp_request(void *arg)
+  +#if SNTP_SUPPORT_MULTIPLE_SERVERS
+  +      /* If the primary's name doesn't resolve in time, move on to the next
+  +       * server. Without this timer a primary whose DNS never completes stalls
+  +       * the client forever and the configured fallback is never tried. */
+  +      sys_timeout((u32_t)SNTP_RECV_TIMEOUT, sntp_try_next_server, NULL);
+  +#endif /* SNTP_SUPPORT_MULTIPLE_SERVERS */
+         return;
+       } else if (err == ERR_OK) {
+         sntp_servers[sntp_current_server].addr = sntp_server_address;
+  +11 -0
+
+src/core/ipv4/ip4.c
+  @@ -576,8 +576,11 @@ ip4_input(struct pbuf *p, struct netif *inp)
+  -  /* for unicast packet, check NAPT table and modify dest if needed */
+  -  if (!inp->napt && ip4_addr_cmp(&iphdr->dest, netif_ip4_addr(inp)))
+  +  /* Only intercept packets addressed to the portmapped external NTP server
+  +     (GoldHEN's hardcoded 216.239.35.0). Calling ip_napt_recv / evaluating the
+  +     portmap for every other packet makes the PS4's Settings network checks
+  +     hang, so keep this strictly limited to the exact intercepted address. */
+  +  if (IPH_PROTO(iphdr) == IP_PROTO_UDP && iphdr->dest.addr == 0x0023EFD8UL)
+       ip_napt_recv(p, iphdr);
+   #endif
+   #endif /* ESP_LWIP */
+  @@ -1076,6 +1079,16 @@ ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *d
+  +
+  +#if ESP_LWIP
+  +#if IP_NAPT
+  +  /* Rewrite the source of replies from a portmapped local service back to the
+  +     mapped external address/port, so a client that queried a hardcoded external
+  +     server address (e.g. GoldHEN's NTP to 216.239.35.0) accepts the response. */
+  +  ip_napt_output(p, iphdr);
+  +#endif
+  +#endif /* ESP_LWIP */
+  +
+   #if IP_FRAG
+     /* don't fragment if interface has mtu set to 0 [loopif] */
+     if (netif->mtu && (p->tot_len > netif->mtu)) {
+  +15 -2
+
+src/core/ipv4/ip4_napt.c
+  @@ -663,7 +663,9 @@ ip_napt_recv(struct pbuf *p, struct ip_hdr *iphdr)
+  -    if (m) {
+  +    /* only rewrite when the packet is actually addressed to the portmapped
+  +     * external address (e.g. GoldHEN's hardcoded NTP server IP) */
+  +    if (m && iphdr->dest.addr == m->maddr) {
+         /* packet to mapped port: rewrite destination */
+         if (m->dport != udphdr->dest)
+           ip_napt_modify_port_udp(udphdr, 1, m->dport);
+  @@ -684,6 +686,27 @@ ip_napt_recv(struct pbuf *p, struct ip_hdr *iphdr)
+  +/* Rewrite the source of replies from a portmapped local service back to the
+  + * mapped external address/port (inverse of the DNAT performed in
+  + * ip_napt_recv), so a client that queried a hardcoded external server address
+  + * accepts the response. */
+  +void
+  +ip_napt_output(struct pbuf *p, struct ip_hdr *iphdr)
+  +{
+  +#if LWIP_UDP
+  +  if (IPH_PROTO(iphdr) == IP_PROTO_UDP && p->len >= IPH_HL(iphdr) * 4 + sizeof(struct udp_hdr)) {
+  +    struct udp_hdr *udphdr = (struct udp_hdr *)((u8_t *)iphdr + IPH_HL(iphdr) * 4);
+  +    struct portmap_table *m = ip_portmap_find_dest(IP_PROTO_UDP, udphdr->src, iphdr->src.addr);
+  +    if (m) {
+  +      if (m->mport != udphdr->src)
+  +        ip_napt_modify_port_udp(udphdr, 0, m->mport);
+  +      ip_napt_modify_addr_udp(udphdr, &iphdr->src, m->maddr);
+  +      ip_napt_modify_addr(iphdr, &iphdr->src, m->maddr);
+  +    }
+  +  }
+  +#endif /* LWIP_UDP */
+  +}
+  +
+   err_t
+   ip_napt_forward(struct pbuf *p, struct ip_hdr *iphdr, struct netif *inp, struct netif *outp)
+   {
+  +24 -1
+
+src/include/lwip/ip4_napt.h
+  @@ -43,7 +43,6 @@
+  -#if IP_FORWARD
+   #if IP_NAPT
+   
+   #include "lwip/def.h"
+  @@ -84,12 +83,23 @@ ip_napt_forward(struct pbuf *p, struct ip_hdr *iphdr, struct netif *inp, struct
+  +/**
+  + * Called from ip4_output for packets leaving the stack. Rewrites the source
+  + * address/port of replies from a locally hosted portmapped service back to the
+  + * mapped external address/port, so a client that queried a hardcoded external
+  + * server address accepts the response (inverse of ip_napt_recv's DNAT).
+  + *
+  + * @param p the packet to send (p->payload points to IP header)
+  + * @param iphdr the IP header of the output packet
+  + */
+  +void
+  +ip_napt_output(struct pbuf *p, struct ip_hdr *iphdr);
+  +
+   #ifdef __cplusplus
+   }
+   #endif
+   
+   #endif /* IP_NAPT */
+  -#endif /* IP_FORWARD */
+   #endif /* ESP_LWIP */
+   
+   #endif /* LWIP_HDR_IP4_NAPT_H */
+  +12 -2
+
+src/include/lwip/lwip_napt.h
+  @@ -47,7 +47,6 @@ extern "C" {
+  -#if IP_FORWARD
+   #if IP_NAPT
+   
+   /* Default size of the tables used for NAPT */
+  @@ -112,7 +111,6 @@ u8_t
+  -#endif /* IP_FORWARD */
+   #endif /* ESP_LWIP */
+   
+   #ifdef __cplusplus
+  +0 -2

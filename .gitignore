@@ -1,0 +1,16 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+
+# Arduino IDE 2 temp
+*.partitions.bin
+*.bootloader.bin
